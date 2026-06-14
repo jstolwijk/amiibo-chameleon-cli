@@ -70,12 +70,6 @@ fn validate_bytes(path: &Path, bin_root: &Path, bytes: &[u8]) -> Result<Validate
         });
     }
 
-    if bytes[12] != 0xE1 || bytes[13] >> 4 != 1 || bytes[14] != 0x3E {
-        return Err(Error::InvalidDump {
-            path: path.to_owned(),
-            reason: "invalid NTAG215 capability container on page 3".into(),
-        });
-    }
     if bytes[520..524] != [0x01, 0x00, 0x0F, 0xBD] {
         return Err(Error::InvalidDump {
             path: path.to_owned(),
@@ -107,9 +101,11 @@ fn validate_bytes(path: &Path, bin_root: &Path, bytes: &[u8]) -> Result<Validate
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DUMP_SIZE, validate_bytes};
+    use super::{DUMP_SIZE, validate, validate_bytes};
 
     fn valid_dump() -> Vec<u8> {
         let mut bytes = vec![0; DUMP_SIZE];
@@ -146,11 +142,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_ntag215_configuration() {
+    fn rejects_invalid_ntag215_lock_page() {
         let mut bytes = valid_dump();
-        bytes[14] = 0;
+        bytes[523] = 0;
         let error = validate_bytes(Path::new("bad.bin"), Path::new("."), &bytes).unwrap_err();
-        assert!(error.to_string().contains("capability container"));
+        assert!(error.to_string().contains("dynamic lock page"));
     }
 
     #[test]
@@ -159,5 +155,27 @@ mod tests {
         bytes[532] = 1;
         let error = validate_bytes(Path::new("bad.bin"), Path::new("."), &bytes).unwrap_err();
         assert!(error.to_string().contains("PWD/PACK"));
+    }
+
+    #[test]
+    fn reread_revalidates_a_changed_dump() {
+        let root = std::env::temp_dir().join(format!(
+            "amiibo-dump-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("Mario.bin");
+        fs::write(&path, valid_dump()).unwrap();
+        let dump = validate(&path, &root).unwrap();
+
+        let mut changed = valid_dump();
+        changed[3] ^= 1;
+        fs::write(&path, changed).unwrap();
+        let error = dump.read().unwrap_err();
+        assert!(error.to_string().contains("BCC0"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

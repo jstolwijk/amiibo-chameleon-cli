@@ -166,9 +166,10 @@ fn is_hidden(name: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::index;
+    use super::{index, update};
     use crate::dump::DUMP_SIZE;
 
     fn temp_repository() -> std::path::PathBuf {
@@ -215,5 +216,94 @@ mod tests {
         assert_eq!(entries[1].full_name, "Series B / Mario");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn updates_existing_checkout_from_local_remote() {
+        let root = std::env::temp_dir().join(format!("amiibo-git-test-{}", unique()));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let cache = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&root, &["init", "-b", "main", seed.to_str().unwrap()]);
+        fs::create_dir_all(seed.join("Amiibo Bin/Series A")).unwrap();
+        write_valid_dump(&seed.join("Amiibo Bin/Series A/Mario.bin"));
+        git(&seed, &["add", "."]);
+        git(
+            &seed,
+            &[
+                "-c",
+                "user.name=Amiibo Test",
+                "-c",
+                "user.email=amiibo@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "main"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+                cache.to_str().unwrap(),
+            ],
+        );
+
+        write_valid_dump(&seed.join("Amiibo Bin/Series A/Link.bin"));
+        git(&seed, &["add", "."]);
+        git(
+            &seed,
+            &[
+                "-c",
+                "user.name=Amiibo Test",
+                "-c",
+                "user.email=amiibo@example.invalid",
+                "commit",
+                "-m",
+                "add Link",
+            ],
+        );
+        git(&seed, &["push"]);
+
+        update(&cache).unwrap();
+        let entries = index(&cache).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.full_name.ends_with("Link"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    fn git(directory: &std::path::Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

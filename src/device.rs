@@ -340,7 +340,9 @@ fn flash_ntag215<T: Transport + ?Sized>(
         )));
     }
     let rollback = if is_ntag_family(target.hf_type) {
-        Some(backup_ntag(transport, slot)?)
+        let backup = backup_ntag(transport, slot)?;
+        ensure_restorable(&backup)?;
+        Some(backup)
     } else {
         None
     };
@@ -505,6 +507,7 @@ fn restore_ntag<T: Transport + ?Sized>(
     backup: &NtagBackup,
     active_slot: u8,
 ) -> Result<()> {
+    ensure_restorable(backup)?;
     let mut type_payload = vec![backup.slot - 1];
     type_payload.extend_from_slice(&backup.hf_type.0.to_be_bytes());
     command_with_payload(transport, SET_SLOT_TAG_TYPE, &type_payload, 0..=0)?;
@@ -528,13 +531,7 @@ fn restore_ntag<T: Transport + ?Sized>(
     command_with_payload(
         transport,
         MF0_NTAG_SET_COUNTER_DATA,
-        &[
-            0,
-            counter[0],
-            counter[1],
-            counter[2],
-            if backup.counter_tearing { 0x00 } else { 0xBD },
-        ],
+        &[0x80, counter[0], counter[1], counter[2]],
         0..=0,
     )?;
     command_with_payload(
@@ -569,6 +566,16 @@ fn restore_ntag<T: Transport + ?Sized>(
     )?;
     command(transport, SLOT_DATA_CONFIG_SAVE, 0..=0)?;
     command_with_payload(transport, SET_ACTIVE_SLOT, &[active_slot - 1], 0..=0)?;
+    Ok(())
+}
+
+fn ensure_restorable(backup: &NtagBackup) -> Result<()> {
+    if backup.counter_tearing {
+        return Err(Error::Protocol(
+            "the captured NTAG counter has an active tearing event, which firmware cannot recreate"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -822,11 +829,12 @@ mod tests {
         GET_SLOT_INFO, GET_SLOT_TAG_NICK, HF14A_GET_ANTI_COLL_DATA, HF14A_SET_ANTI_COLL_DATA,
         MF0_NTAG_GET_COUNTER_DATA, MF0_NTAG_GET_DETECTION_ENABLE, MF0_NTAG_GET_PAGE_COUNT,
         MF0_NTAG_GET_SIGNATURE_DATA, MF0_NTAG_GET_UID_MAGIC_MODE, MF0_NTAG_GET_VERSION_DATA,
-        MF0_NTAG_GET_WRITE_MODE, MF0_NTAG_READ_EMU_PAGE_DATA, MF0_NTAG_SET_UID_MAGIC_MODE,
-        MF0_NTAG_SET_WRITE_MODE, MF0_NTAG_WRITE_EMU_PAGE_DATA, SET_ACTIVE_SLOT,
-        SET_SLOT_DATA_DEFAULT, SET_SLOT_ENABLE, SET_SLOT_TAG_NICK, SET_SLOT_TAG_TYPE,
-        SLOT_DATA_CONFIG_SAVE, TagType, apply_amiibo_auth_pages, backup_ntag, flash_ntag215,
-        inspect,
+        MF0_NTAG_GET_WRITE_MODE, MF0_NTAG_READ_EMU_PAGE_DATA, MF0_NTAG_SET_COUNTER_DATA,
+        MF0_NTAG_SET_DETECTION_ENABLE, MF0_NTAG_SET_SIGNATURE_DATA, MF0_NTAG_SET_UID_MAGIC_MODE,
+        MF0_NTAG_SET_VERSION_DATA, MF0_NTAG_SET_WRITE_MODE, MF0_NTAG_WRITE_EMU_PAGE_DATA,
+        NtagBackup, SET_ACTIVE_SLOT, SET_SLOT_DATA_DEFAULT, SET_SLOT_ENABLE, SET_SLOT_TAG_NICK,
+        SET_SLOT_TAG_TYPE, SLOT_DATA_CONFIG_SAVE, STATUS_FLASH_READ_FAIL, TagType,
+        apply_amiibo_auth_pages, backup_ntag, flash_ntag215, inspect, restore_ntag, verify_ntag215,
     };
     use crate::protocol;
 
@@ -1078,6 +1086,198 @@ mod tests {
         apply_amiibo_auth_pages(&mut pages, [0x04, 0x64, 0x7F, 0x62, 0x98, 0x3C, 0x80]).unwrap();
         assert_eq!(&pages[532..536], &[0xAC, 0xB2, 0xF4, 0x4D]);
         assert_eq!(&pages[536..540], &[0x80, 0x80, 0, 0]);
+    }
+
+    #[test]
+    fn restore_reapplies_all_captured_ntag_state() {
+        let backup = NtagBackup {
+            firmware_major: 2,
+            firmware_minor: 1,
+            git_version: "v2.1.0".into(),
+            slot: 4,
+            hf_type: TagType(1101),
+            hf_enabled: true,
+            hf_nickname: "Mario".into(),
+            lf_type: TagType(0),
+            lf_enabled: false,
+            lf_nickname: String::new(),
+            uid: vec![4, 1, 2, 3, 4, 5, 6],
+            atqa: [0x44, 0],
+            sak: 0,
+            ats: vec![],
+            uid_magic: false,
+            write_mode: 2,
+            detection_enabled: true,
+            counter: 0x123456,
+            counter_tearing: false,
+            version_data: vec![0x11; 8],
+            signature_data: vec![0x22; 32],
+            pages: vec![0x33; 540],
+        };
+        let mut responses = [
+            response(SET_SLOT_TAG_TYPE, &[]),
+            response(SET_SLOT_DATA_DEFAULT, &[]),
+            response(SET_ACTIVE_SLOT, &[]),
+        ]
+        .concat();
+        for _ in backup.pages.chunks(16 * 4) {
+            responses.extend(response(MF0_NTAG_WRITE_EMU_PAGE_DATA, &[]));
+        }
+        for command in [
+            HF14A_SET_ANTI_COLL_DATA,
+            MF0_NTAG_SET_VERSION_DATA,
+            MF0_NTAG_SET_SIGNATURE_DATA,
+            MF0_NTAG_SET_COUNTER_DATA,
+            MF0_NTAG_SET_UID_MAGIC_MODE,
+            MF0_NTAG_SET_WRITE_MODE,
+            MF0_NTAG_SET_DETECTION_ENABLE,
+            SET_SLOT_TAG_NICK,
+            SET_SLOT_ENABLE,
+            SLOT_DATA_CONFIG_SAVE,
+            SET_ACTIVE_SLOT,
+        ] {
+            responses.extend(response(command, &[]));
+        }
+        let mut transport = FakeTransport::new(responses);
+
+        restore_ntag(&mut transport, &backup, 2).unwrap();
+
+        let requests = request_frames(&transport.writes);
+        assert_eq!(
+            requests
+                .iter()
+                .find(|(command, _)| *command == MF0_NTAG_SET_COUNTER_DATA)
+                .unwrap()
+                .1,
+            [0x80, 0x56, 0x34, 0x12]
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .find(|(command, _)| *command == MF0_NTAG_SET_VERSION_DATA)
+                .unwrap()
+                .1,
+            backup.version_data
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .find(|(command, _)| *command == MF0_NTAG_SET_SIGNATURE_DATA)
+                .unwrap()
+                .1,
+            backup.signature_data
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .find(|(command, _)| *command == MF0_NTAG_SET_DETECTION_ENABLE)
+                .unwrap()
+                .1,
+            [1]
+        );
+        assert_eq!(requests.last(), Some(&(SET_ACTIVE_SLOT, vec![1])));
+    }
+
+    #[test]
+    fn restore_rejects_unrestorable_tearing_state_before_writing() {
+        let backup = NtagBackup {
+            firmware_major: 2,
+            firmware_minor: 1,
+            git_version: "v2.1.0".into(),
+            slot: 1,
+            hf_type: TagType(1101),
+            hf_enabled: true,
+            hf_nickname: String::new(),
+            lf_type: TagType(0),
+            lf_enabled: false,
+            lf_nickname: String::new(),
+            uid: vec![4, 1, 2, 3, 4, 5, 6],
+            atqa: [0x44, 0],
+            sak: 0,
+            ats: vec![],
+            uid_magic: false,
+            write_mode: 0,
+            detection_enabled: false,
+            counter: 0,
+            counter_tearing: true,
+            version_data: vec![0; 8],
+            signature_data: vec![0; 32],
+            pages: vec![0; 540],
+        };
+        let mut transport = FakeTransport::new(Vec::new());
+        let error = restore_ntag(&mut transport, &backup, 1).unwrap_err();
+        assert!(error.to_string().contains("tearing event"));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn reports_original_and_rollback_failures() {
+        let mut types = vec![0; 32];
+        types[0..2].copy_from_slice(&1101_u16.to_be_bytes());
+        let mut enabled = vec![0; 16];
+        enabled[0] = 1;
+        let inspect_responses = || {
+            [
+                response(GET_APP_VERSION, &[2, 1]),
+                response(GET_GIT_VERSION, b"v2.1.0"),
+                response(GET_ACTIVE_SLOT, &[1]),
+                response(GET_SLOT_INFO, &types),
+                response(GET_ENABLED_SLOTS, &enabled),
+            ]
+            .concat()
+        };
+        let pages = vec![0; 540];
+        let mut responses = inspect_responses();
+        responses.extend(inspect_responses());
+        responses.extend(
+            [
+                response(GET_SLOT_TAG_NICK, b"Mario"),
+                response_with_status(GET_SLOT_TAG_NICK, STATUS_FLASH_READ_FAIL, &[]),
+                response(SET_ACTIVE_SLOT, &[]),
+                response(
+                    HF14A_GET_ANTI_COLL_DATA,
+                    &[7, 4, 1, 2, 3, 4, 5, 6, 0x44, 0, 0, 0],
+                ),
+                response(MF0_NTAG_GET_UID_MAGIC_MODE, &[0]),
+                response(MF0_NTAG_GET_WRITE_MODE, &[0]),
+                response(MF0_NTAG_GET_DETECTION_ENABLE, &[0]),
+                response(MF0_NTAG_GET_VERSION_DATA, &[0; 8]),
+                response(MF0_NTAG_GET_SIGNATURE_DATA, &[0; 32]),
+                response(MF0_NTAG_GET_COUNTER_DATA, &[0, 0, 0, 0xBD]),
+                response(MF0_NTAG_GET_PAGE_COUNT, &[135]),
+            ]
+            .concat(),
+        );
+        for chunk in pages.chunks(32 * 4) {
+            responses.extend(response(MF0_NTAG_READ_EMU_PAGE_DATA, chunk));
+        }
+        responses.extend(response(SET_ACTIVE_SLOT, &[]));
+        responses.extend(response_with_status(SET_SLOT_TAG_TYPE, 0x70, &[]));
+        responses.extend(response_with_status(SET_SLOT_TAG_TYPE, 0x70, &[]));
+        let mut transport = FakeTransport::new(responses);
+
+        let error =
+            flash_ntag215(&mut transport, 1, &pages, [4, 1, 2, 3, 4, 5, 6], "Mario").unwrap_err();
+        assert!(matches!(&error, crate::error::Error::RollbackFailed { .. }));
+        let text = error.to_string();
+        assert!(text.contains("command 1004 failed"));
+        assert!(text.contains("rollback also failed"));
+    }
+
+    #[test]
+    fn rejects_bad_page_read_back() {
+        let expected = vec![0x5A; 540];
+        let mut actual = expected.clone();
+        actual[100] ^= 1;
+        let mut responses = response(MF0_NTAG_GET_PAGE_COUNT, &[135]);
+        for chunk in actual.chunks(32 * 4) {
+            responses.extend(response(MF0_NTAG_READ_EMU_PAGE_DATA, chunk));
+        }
+        let mut transport = FakeTransport::new(responses);
+
+        let error = verify_ntag215(&mut transport, 1, &expected, [4, 1, 2, 3, 4, 5, 6], "Mario")
+            .unwrap_err();
+        assert!(error.to_string().contains("read-back mismatch"));
     }
 
     fn response(command: u16, payload: &[u8]) -> Vec<u8> {

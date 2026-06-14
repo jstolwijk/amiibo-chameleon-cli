@@ -108,8 +108,9 @@ After resolving a name and before modifying the device:
 
 5. Require a seven-byte UID. Warn, rather than initially reject, if the
    manufacturer byte is not `0x04`.
-6. Validate basic NTAG215 configuration and lock-page positions without
-   modifying them.
+6. Validate the plaintext NTAG215 dynamic-lock, configuration, PWD, and PACK
+   page positions without modifying them. The capability container is within
+   the encrypted Amiibo payload and is not directly inspectable.
 
 Structural checks cannot prove that a dump is cryptographically valid. Without
 cryptographic validation, the command should describe the input as
@@ -185,6 +186,9 @@ not required.
 - If a write or verification fails, attempt to restore the previous slot state.
 - If restoration also fails, report both failures and retain the backup on
   disk for manual recovery.
+- Refuse destructive changes when the captured counter has an active tearing
+  event because the firmware protocol can clear that flag but cannot recreate
+  it during rollback.
 - Never overwrite an occupied slot without `--force` or an interactive
   confirmation. Non-interactive use must require `--force`.
 - Use a per-device lock so two processes cannot program the same Chameleon
@@ -285,28 +289,31 @@ IDs affected by the change.
 | R008 | Exclude `!Essential Files`, keys, hidden files, and support artifacts. | Verified |
 | R009 | Normalize names and require explicit disambiguation of duplicates. | Verified |
 | R010 | Show suggestions for unmatched names without selecting automatically. | Verified |
-| R011 | Validate repository path containment, dump size, UID, BCC, and NTAG215 structure before device changes. | In progress |
+| R011 | Validate repository path containment, dump size, UID, BCC, and NTAG215 structure before device changes. | Verified |
 | R012 | Discover and connect to a Chameleon Ultra over macOS USB serial. | Verified |
 | R013 | Check firmware compatibility before flashing. | Verified |
 | R014 | Back up the target slot before destructive changes. | Verified |
 | R015 | Configure the slot as NTAG215 and write pages 0 through 134. | Verified |
 | R016 | Configure UID, ATQA `4400`, SAK `00`, no ATS, normal writes, and HF enablement. | Verified |
 | R017 | Verify all written pages and emulator settings by reading them back. | Verified |
-| R018 | Attempt rollback after write or verification failure and preserve recovery data if rollback fails. | In progress |
-| R019 | Prevent concurrent programming of the same device. | Not started |
+| R018 | Attempt rollback after write or verification failure and preserve recovery data if rollback fails. | Verified |
+| R019 | Prevent concurrent programming of the same device. | Verified |
 | R020 | Require confirmation or `--force` before overwriting an occupied slot. | Verified |
 | R021 | Never read or use retail key files from AmiiboDB. | Verified |
 | R022 | Expose `search`, `database update`, `slots`, and `flash` commands. | Verified |
-| R023 | Cover database resolution, dump validation, protocol, rollback, and hardware behavior with the test plan above. | In progress |
+| R023 | Cover database resolution, dump validation, protocol, rollback, and hardware behavior with the test plan above. | Verified |
 | R024 | Document AmiiboDB's missing explicit license and upstream data-quality limitations. | Implemented |
 | R025 | Maintain this requirements register and report implementation and verification status by requirement ID. | Implemented |
+| R026 | Validate and restore a versioned backup artifact to a selected slot with destructive-operation confirmation and read-back verification. | Verified |
 
-## Open Decisions
+## Decisions
 
-1. Whether successful flashing should activate the target slot by default.
-2. Whether to preserve an automatic local backup after success or delete it.
-3. Whether repository updates happen automatically before every online command
-   or only when the cache exceeds a defined age.
+1. Successful flashing leaves the verified target slot active.
+2. Automatic recovery artifacts are deleted after successful flashing or
+   successful rollback. They are retained after rollback failure or process
+   interruption.
+3. Every online database lookup updates the cached repository. `--offline`
+   is the explicit opt-out.
 
 ## Hardware Verification Log
 

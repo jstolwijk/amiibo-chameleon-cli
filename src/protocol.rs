@@ -116,7 +116,7 @@ fn lrc(bytes: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
 
     use super::{encode, read_response};
 
@@ -152,6 +152,34 @@ mod tests {
         assert!(error.to_string().contains("payload checksum"));
     }
 
+    #[test]
+    fn rejects_truncated_response() {
+        let frame = response_frame(1000, 0x68, &[2, 1]);
+        let error =
+            read_response(&mut Cursor::new(frame[..frame.len() - 2].to_vec()), 1000).unwrap_err();
+        assert!(error.to_string().contains("failed to fill whole buffer"));
+    }
+
+    #[test]
+    fn reports_transport_timeout() {
+        let mut transport = FailingTransport {
+            error_kind: std::io::ErrorKind::TimedOut,
+            writes_remaining: 0,
+        };
+        let error = read_response(&mut transport, 1000).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn reports_partial_write_failure() {
+        let mut transport = FailingTransport {
+            error_kind: std::io::ErrorKind::BrokenPipe,
+            writes_remaining: 1,
+        };
+        let error = super::transact(&mut transport, 1000, &[]).unwrap_err();
+        assert!(error.to_string().contains("broken pipe"));
+    }
+
     fn response_frame(command: u16, status: u16, payload: &[u8]) -> Vec<u8> {
         let mut frame = encode(command, payload).unwrap();
         frame[4..6].copy_from_slice(&status.to_be_bytes());
@@ -159,5 +187,31 @@ mod tests {
         let last = frame.len() - 1;
         frame[last] = super::lrc(&frame[..last]);
         frame
+    }
+
+    struct FailingTransport {
+        error_kind: std::io::ErrorKind,
+        writes_remaining: usize,
+    }
+
+    impl Read for FailingTransport {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.error_kind))
+        }
+    }
+
+    impl Write for FailingTransport {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.writes_remaining > 0 {
+                self.writes_remaining -= 1;
+                Ok(buffer.len().min(1))
+            } else {
+                Err(std::io::Error::from(self.error_kind))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

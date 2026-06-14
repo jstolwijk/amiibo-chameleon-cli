@@ -23,8 +23,12 @@ The first implementation slice is available:
 - `amiibo flash <name> --slot <1-8> --force` resolves an exact database entry,
   configures NTAG215 emulation, writes pages 0 through 134, and verifies all
   memory and emulator settings before reporting success.
-
-Standalone restore and per-device process locking are not implemented yet.
+- `amiibo restore <backup> --slot <1-8> --force` validates a versioned recovery
+  artifact, restores all captured NTAG emulator state, and verifies it by
+  reading the slot back.
+- Device access is protected by a per-serial-port process lock. Flashing writes
+  a temporary recovery artifact before destructive changes and removes it only
+  after success or successful rollback.
 
 All requirements and their implementation status are tracked in the
 `Requirements Tracking` section of that document. New requirements must be
@@ -38,5 +42,6 @@ cargo run -- database update
 cargo run -- search "Mario" --series "Super Smash Bros Amiibo" --offline
 cargo run -- slots
 cargo run -- backup --slot 2 --output slot-2-backup.json
+cargo run -- restore slot-2-backup.json --slot 2 --force
 cargo run -- flash "Mario" --series "Super Smash Bros Amiibo" --slot 6 --offline --force
 ```
