@@ -6,17 +6,33 @@ use std::path::PathBuf;
 pub enum Error {
     CacheUnavailable,
     DatabaseMissing(PathBuf),
+    DeviceBusy(PathBuf),
     DeviceNotFound,
     MultipleDevices(Vec<PathBuf>),
     GitFailed(String),
     InvalidDatabase(PathBuf),
-    InvalidDump { path: PathBuf, reason: String },
+    InvalidBackup(String),
+    InvalidDump {
+        path: PathBuf,
+        reason: String,
+    },
     Selection(String),
     Io(io::Error),
     Protocol(String),
+    RecoveryPreserved {
+        source: Box<Error>,
+        path: PathBuf,
+    },
+    RollbackFailed {
+        operation: Box<Error>,
+        rollback: Box<Error>,
+    },
     Json(serde_json::Error),
     Serial(serialport::Error),
-    UnsupportedFirmware { major: u8, minor: u8 },
+    UnsupportedFirmware {
+        major: u8,
+        minor: u8,
+    },
 }
 
 impl fmt::Display for Error {
@@ -31,6 +47,11 @@ impl fmt::Display for Error {
             Self::DatabaseMissing(path) => write!(
                 formatter,
                 "AmiiboDB cache does not exist at {}; run `amiibo database update` first",
+                path.display()
+            ),
+            Self::DeviceBusy(path) => write!(
+                formatter,
+                "Chameleon at {} is already in use by another amiibo process",
                 path.display()
             ),
             Self::DeviceNotFound => write!(
@@ -50,12 +71,22 @@ impl fmt::Display for Error {
             Self::InvalidDatabase(path) => {
                 write!(formatter, "invalid AmiiboDB checkout at {}", path.display())
             }
+            Self::InvalidBackup(reason) => write!(formatter, "invalid backup artifact: {reason}"),
             Self::InvalidDump { path, reason } => {
                 write!(formatter, "invalid dump {}: {reason}", path.display())
             }
             Self::Selection(message) => formatter.write_str(message),
             Self::Io(error) => error.fmt(formatter),
             Self::Protocol(message) => write!(formatter, "device protocol error: {message}"),
+            Self::RecoveryPreserved { source, path } => write!(
+                formatter,
+                "{source}; recovery artifact retained at {}",
+                path.display()
+            ),
+            Self::RollbackFailed {
+                operation,
+                rollback,
+            } => write!(formatter, "{operation}; rollback also failed: {rollback}"),
             Self::Json(error) => write!(formatter, "backup format error: {error}"),
             Self::Serial(error) => write!(formatter, "serial error: {error}"),
             Self::UnsupportedFirmware { major, minor } => write!(

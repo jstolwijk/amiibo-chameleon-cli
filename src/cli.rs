@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use strsim::jaro_winkler;
 
-use crate::backup::BackupArtifact;
+use crate::backup::{self, BackupArtifact};
 use crate::database::{self, Entry};
 use crate::device::Connection;
 use crate::error::Result;
@@ -28,6 +28,8 @@ enum Command {
     Slots(DeviceArgs),
     /// Save a complete NTAG slot backup for later recovery.
     Backup(BackupArgs),
+    /// Restore a versioned NTAG backup artifact to a slot.
+    Restore(RestoreArgs),
     /// Resolve, write, and verify an Amiibo on a Chameleon Ultra.
     Flash(FlashArgs),
 }
@@ -62,6 +64,21 @@ struct BackupArgs {
     /// Chameleon serial device, normally below /dev/cu.*.
     #[arg(long)]
     port: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// JSON backup artifact to restore.
+    backup: PathBuf,
+    /// Target slot number.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
+    slot: u8,
+    /// Chameleon serial device, normally below /dev/cu.*.
+    #[arg(long)]
+    port: Option<PathBuf>,
+    /// Confirm that the target slot may be overwritten.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -103,8 +120,32 @@ pub fn run() -> Result<()> {
         Command::Search(arguments) => search(arguments)?,
         Command::Slots(arguments) => slots(arguments)?,
         Command::Backup(arguments) => backup(arguments)?,
+        Command::Restore(arguments) => restore(arguments)?,
         Command::Flash(arguments) => flash(arguments)?,
     }
+    Ok(())
+}
+
+fn restore(arguments: RestoreArgs) -> Result<()> {
+    if !arguments.force {
+        return Err(crate::error::Error::Selection(
+            "restoring is destructive; rerun with `--force` after checking the target slot".into(),
+        ));
+    }
+    let artifact = BackupArtifact::read(&arguments.backup)?;
+    let backup = artifact.into_device(arguments.slot)?;
+    let mut device = Connection::open(arguments.port.as_deref())?;
+    eprintln!(
+        "Restoring slot {} is not transactional; recovery is best-effort until verification passes.",
+        arguments.slot
+    );
+    device.restore_ntag(&backup)?;
+    println!(
+        "Restored and verified {} to slot {} on {}",
+        arguments.backup.display(),
+        arguments.slot,
+        device.path().display()
+    );
     Ok(())
 }
 
@@ -146,7 +187,39 @@ fn flash(arguments: FlashArgs) -> Result<()> {
     let bytes = entry.dump.read()?;
     let nickname = nickname(&entry.full_name);
     let mut device = Connection::open(arguments.port.as_deref())?;
-    device.flash_ntag215(arguments.slot, &bytes, entry.dump.uid, &nickname)?;
+    let info = device.inspect()?;
+    let target = info.slots[usize::from(arguments.slot - 1)];
+    let recovery = if matches!(target.hf_type.0, 1100..=1108) {
+        let backup = device.backup_ntag(arguments.slot)?;
+        let path = backup::write_recovery(backup, device.path())?;
+        eprintln!(
+            "Flashing is not transactional; temporary recovery artifact: {}",
+            path.display()
+        );
+        Some(path)
+    } else {
+        eprintln!(
+            "Flashing is not transactional; slot {} has no NTAG state to back up.",
+            arguments.slot
+        );
+        None
+    };
+
+    if let Err(error) = device.flash_ntag215(arguments.slot, &bytes, entry.dump.uid, &nickname) {
+        if let Some(path) = recovery {
+            if matches!(&error, crate::error::Error::RollbackFailed { .. }) {
+                return Err(crate::error::Error::RecoveryPreserved {
+                    source: Box::new(error),
+                    path,
+                });
+            }
+            std::fs::remove_file(path)?;
+        }
+        return Err(error);
+    }
+    if let Some(path) = recovery {
+        std::fs::remove_file(path)?;
+    }
     println!(
         "Flashed and verified {} in slot {} on {}",
         entry.full_name,
@@ -337,6 +410,7 @@ mod tests {
             full_name,
             dump: ValidatedDump {
                 path: PathBuf::from("fixture.bin"),
+                bin_root: PathBuf::from("."),
                 uid: [0; 7],
                 manufacturer_warning: false,
             },

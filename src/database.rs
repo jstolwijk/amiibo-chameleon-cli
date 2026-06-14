@@ -190,6 +190,10 @@ mod tests {
         bytes[3] = 0x88 ^ bytes[0] ^ bytes[1] ^ bytes[2];
         bytes[4..8].copy_from_slice(&[3, 4, 5, 6]);
         bytes[8] = bytes[4] ^ bytes[5] ^ bytes[6] ^ bytes[7];
+        bytes[12..16].copy_from_slice(&[0xE1, 0x10, 0x3E, 0]);
+        bytes[520..524].copy_from_slice(&[0x01, 0x00, 0x0F, 0xBD]);
+        bytes[524..528].copy_from_slice(&[0x00, 0x00, 0x00, 0x04]);
+        bytes[528..532].copy_from_slice(&[0x5F, 0, 0, 0]);
         fs::write(path, bytes).unwrap();
     }
 

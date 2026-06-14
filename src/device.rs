@@ -1,9 +1,10 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serialport::{ClearBuffer, SerialPort};
+use std::os::fd::AsRawFd;
 
 use crate::error::{Error, Result};
 use crate::protocol::{self, Transport};
@@ -27,11 +28,15 @@ const MF0_NTAG_SET_UID_MAGIC_MODE: u16 = 4020;
 const MF0_NTAG_READ_EMU_PAGE_DATA: u16 = 4021;
 const MF0_NTAG_WRITE_EMU_PAGE_DATA: u16 = 4022;
 const MF0_NTAG_GET_VERSION_DATA: u16 = 4023;
+const MF0_NTAG_SET_VERSION_DATA: u16 = 4024;
 const MF0_NTAG_GET_SIGNATURE_DATA: u16 = 4025;
+const MF0_NTAG_SET_SIGNATURE_DATA: u16 = 4026;
 const MF0_NTAG_GET_COUNTER_DATA: u16 = 4027;
+const MF0_NTAG_SET_COUNTER_DATA: u16 = 4028;
 const MF0_NTAG_GET_PAGE_COUNT: u16 = 4030;
 const MF0_NTAG_GET_WRITE_MODE: u16 = 4031;
 const MF0_NTAG_SET_WRITE_MODE: u16 = 4032;
+const MF0_NTAG_SET_DETECTION_ENABLE: u16 = 4033;
 const MF0_NTAG_GET_DETECTION_ENABLE: u16 = 4036;
 const NTAG_215: u16 = 1101;
 const STATUS_FLASH_READ_FAIL: u16 = 0x71;
@@ -128,6 +133,7 @@ impl fmt::Display for TagType {
 pub struct Connection {
     path: PathBuf,
     transport: Box<dyn SerialPort>,
+    _lock: DeviceLock,
 }
 
 impl Connection {
@@ -137,14 +143,19 @@ impl Connection {
         }
 
         let mut matches = Vec::new();
+        let mut busy = None;
         for path in candidate_ports()? {
-            if let Ok(connection) = Self::open_path(&path) {
-                matches.push(connection);
+            match Self::open_path(&path) {
+                Ok(connection) => matches.push(connection),
+                Err(Error::DeviceBusy(path)) => busy = Some(path),
+                Err(_) => {}
             }
         }
 
         match matches.len() {
-            0 => Err(Error::DeviceNotFound),
+            0 => busy.map_or(Err(Error::DeviceNotFound), |path| {
+                Err(Error::DeviceBusy(path))
+            }),
             1 => Ok(matches.remove(0)),
             _ => Err(Error::MultipleDevices(
                 matches.into_iter().map(|device| device.path).collect(),
@@ -153,6 +164,7 @@ impl Connection {
     }
 
     fn open_path(path: &Path) -> Result<Self> {
+        let lock = DeviceLock::acquire(path)?;
         let mut transport = serialport::new(path.to_string_lossy(), 115_200)
             .timeout(Duration::from_secs(3))
             .open()?;
@@ -162,6 +174,7 @@ impl Connection {
         let mut connection = Self {
             path: path.to_owned(),
             transport,
+            _lock: lock,
         };
         connection.app_version()?;
         Ok(connection)
@@ -189,8 +202,65 @@ impl Connection {
         flash_ntag215(self.transport.as_mut(), slot, dump, uid, nickname)
     }
 
+    pub fn restore_ntag(&mut self, backup: &NtagBackup) -> Result<()> {
+        let (major, minor) = self.app_version()?;
+        if major != 2 {
+            return Err(Error::UnsupportedFirmware { major, minor });
+        }
+        restore_ntag(self.transport.as_mut(), backup, backup.slot)?;
+        verify_restored_ntag(self.transport.as_mut(), backup)
+    }
+
     fn app_version(&mut self) -> Result<(u8, u8)> {
         app_version(self.transport.as_mut())
+    }
+}
+
+#[derive(Debug)]
+struct DeviceLock {
+    file: File,
+}
+
+impl DeviceLock {
+    fn acquire(device: &Path) -> Result<Self> {
+        let directory = std::env::temp_dir().join("amiibo-device-locks");
+        fs::create_dir_all(&directory)?;
+        let name = device
+            .to_string_lossy()
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+                    char::from(byte)
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(format!("{name}.lock")))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            Ok(Self { file })
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Err(Error::DeviceBusy(device.to_owned()))
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl Drop for DeviceLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -279,9 +349,10 @@ fn flash_ntag215<T: Transport + ?Sized>(
     if let Err(error) = result {
         if let Some(backup) = rollback {
             if let Err(rollback_error) = restore_ntag(transport, &backup, before.active_slot) {
-                return Err(Error::Protocol(format!(
-                    "{error}; rollback also failed: {rollback_error}"
-                )));
+                return Err(Error::RollbackFailed {
+                    operation: Box::new(error),
+                    rollback: Box::new(rollback_error),
+                });
             }
         } else {
             let _ = command_with_payload(transport, SET_SLOT_ENABLE, &[slot - 1, 2, 0], 0..=0);
@@ -443,6 +514,31 @@ fn restore_ntag<T: Transport + ?Sized>(
     set_anti_collision(transport, &backup.uid, backup.atqa, backup.sak, &backup.ats)?;
     command_with_payload(
         transport,
+        MF0_NTAG_SET_VERSION_DATA,
+        &backup.version_data,
+        0..=0,
+    )?;
+    command_with_payload(
+        transport,
+        MF0_NTAG_SET_SIGNATURE_DATA,
+        &backup.signature_data,
+        0..=0,
+    )?;
+    let counter = backup.counter.to_le_bytes();
+    command_with_payload(
+        transport,
+        MF0_NTAG_SET_COUNTER_DATA,
+        &[
+            0,
+            counter[0],
+            counter[1],
+            counter[2],
+            if backup.counter_tearing { 0x00 } else { 0xBD },
+        ],
+        0..=0,
+    )?;
+    command_with_payload(
+        transport,
         MF0_NTAG_SET_UID_MAGIC_MODE,
         &[u8::from(backup.uid_magic)],
         0..=0,
@@ -451,6 +547,12 @@ fn restore_ntag<T: Transport + ?Sized>(
         transport,
         MF0_NTAG_SET_WRITE_MODE,
         &[backup.write_mode],
+        0..=0,
+    )?;
+    command_with_payload(
+        transport,
+        MF0_NTAG_SET_DETECTION_ENABLE,
+        &[u8::from(backup.detection_enabled)],
         0..=0,
     )?;
     command_with_payload(
@@ -468,6 +570,35 @@ fn restore_ntag<T: Transport + ?Sized>(
     command(transport, SLOT_DATA_CONFIG_SAVE, 0..=0)?;
     command_with_payload(transport, SET_ACTIVE_SLOT, &[active_slot - 1], 0..=0)?;
     Ok(())
+}
+
+fn verify_restored_ntag<T: Transport + ?Sized>(
+    transport: &mut T,
+    expected: &NtagBackup,
+) -> Result<()> {
+    let actual = backup_ntag(transport, expected.slot)?;
+    let matches = actual.hf_type == expected.hf_type
+        && actual.hf_enabled == expected.hf_enabled
+        && actual.hf_nickname == expected.hf_nickname
+        && actual.uid == expected.uid
+        && actual.atqa == expected.atqa
+        && actual.sak == expected.sak
+        && actual.ats == expected.ats
+        && actual.uid_magic == expected.uid_magic
+        && actual.write_mode == expected.write_mode
+        && actual.detection_enabled == expected.detection_enabled
+        && actual.counter == expected.counter
+        && actual.counter_tearing == expected.counter_tearing
+        && actual.version_data == expected.version_data
+        && actual.signature_data == expected.signature_data
+        && actual.pages == expected.pages;
+    if matches {
+        Ok(())
+    } else {
+        Err(Error::Protocol(
+            "restored NTAG state did not pass read-back verification".into(),
+        ))
+    }
 }
 
 fn backup_ntag<T: Transport + ?Sized>(transport: &mut T, slot: u8) -> Result<NtagBackup> {
@@ -684,10 +815,11 @@ fn candidate_ports() -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        GET_ACTIVE_SLOT, GET_APP_VERSION, GET_ENABLED_SLOTS, GET_GIT_VERSION, GET_SLOT_INFO,
-        GET_SLOT_TAG_NICK, HF14A_GET_ANTI_COLL_DATA, HF14A_SET_ANTI_COLL_DATA,
+        DeviceLock, GET_ACTIVE_SLOT, GET_APP_VERSION, GET_ENABLED_SLOTS, GET_GIT_VERSION,
+        GET_SLOT_INFO, GET_SLOT_TAG_NICK, HF14A_GET_ANTI_COLL_DATA, HF14A_SET_ANTI_COLL_DATA,
         MF0_NTAG_GET_COUNTER_DATA, MF0_NTAG_GET_DETECTION_ENABLE, MF0_NTAG_GET_PAGE_COUNT,
         MF0_NTAG_GET_SIGNATURE_DATA, MF0_NTAG_GET_UID_MAGIC_MODE, MF0_NTAG_GET_VERSION_DATA,
         MF0_NTAG_GET_WRITE_MODE, MF0_NTAG_READ_EMU_PAGE_DATA, MF0_NTAG_SET_UID_MAGIC_MODE,
@@ -741,6 +873,22 @@ mod tests {
     fn formats_known_and_unknown_tag_types() {
         assert_eq!(TagType(1101).to_string(), "NTAG 215");
         assert_eq!(TagType(65000).to_string(), "Unknown (65000)");
+    }
+
+    #[test]
+    fn device_lock_excludes_concurrent_processes_and_releases_on_drop() {
+        let path = std::path::PathBuf::from(format!(
+            "/dev/cu.amiibo-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = DeviceLock::acquire(&path).unwrap();
+        let error = DeviceLock::acquire(&path).unwrap_err();
+        assert!(matches!(error, crate::error::Error::DeviceBusy(ref busy) if busy == &path));
+        drop(first);
+        DeviceLock::acquire(&path).unwrap();
     }
 
     #[test]
